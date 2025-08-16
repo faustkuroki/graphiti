@@ -22,6 +22,7 @@ services:
       start_period: 60s
 
 
+
   graphiti-app:
     image: python:3.11-slim
     restart: unless-stopped
