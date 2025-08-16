@@ -33,7 +33,7 @@ services:
       bash -lc "
       pip install --no-cache-dir uvicorn[standard]==0.30.3 fastapi>=0.112,<0.117
       anyio>=4 google-generativeai>=0.7
-      git+https://github.com/<your_github>/graphiti-core@feature/gemini-support#egg=graphiti-core
+      git+https://github.com/faustkuroki/graphiti-core@feature/gemini-support#egg=graphiti-core
       && uvicorn app:app --host 0.0.0.0 --port 8000
       "
     depends_on:
