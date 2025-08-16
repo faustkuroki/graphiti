@@ -1,176 +1,173 @@
+import os, json, time
+from datetime import datetime, timezone
+from typing import Optional, Union, List
+
+from fastapi import FastAPI, HTTPException, Query, Body
+from pydantic import BaseModel
+from neo4j import GraphDatabase
+
 from graphiti_core import Graphiti
-from graphiti_core.llm_client.gemini_client import GeminiClient, LLMConfig
-from graphiti_core.embedder.gemini import GeminiEmbedder, GeminiEmbedderConfig
+from graphiti_core.nodes import EpisodeType
+
+# КЛИЕНТЫ ИЗ ТВОЕГО ФОРКА
+from graphiti_core.llm_client.gemini_client import GeminiClient
+from graphiti_core.embedder.gemini import GeminiEmbedder
 from graphiti_core.cross_encoder.gemini_reranker_client import GeminiRerankerClient
-import os
 
-from fastapi import FastAPI, Query, Body
-from fastapi.responses import JSONResponse
+NEO4J_URI = os.getenv("NEO4J_URI", "bolt://neo4j:7687")
+NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
+NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "password")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+if not GOOGLE_API_KEY:
+    raise RuntimeError("Set GOOGLE_API_KEY (или GEMINI_API_KEY)")
 
-api_key = os.getenv("GOOGLE_API_KEY")
-neo4j_uri = os.getenv("NEO4J_URI", "bolt://neo4j:7687")
-neo4j_user = os.getenv("NEO4J_USER", "neo4j")
-neo4j_pass = os.getenv("NEO4J_PASS", "password")
+LLM_MODEL    = os.getenv("GEMINI_LLM_MODEL", "gemini-2.0-flash")
+EMB_MODEL    = os.getenv("GEMINI_EMB_MODEL", "text-embedding-004")
+RERANK_MODEL = os.getenv("GEMINI_RERANK_MODEL", "gemini-2.0-flash")
 
+# Инициализируем Graphiti с нашими клиентами
 graphiti = Graphiti(
-    neo4j_uri,
-    neo4j_user,
-    neo4j_pass,
-    llm_client=GeminiClient(
-        config=LLMConfig(api_key=api_key, model="gemini-2.0-flash")
-    ),
-    embedder=GeminiEmbedder(
-        config=GeminiEmbedderConfig(api_key=api_key, embedding_model="embedding-001")
-    ),
-    cross_encoder=GeminiRerankerClient(
-        config=LLMConfig(api_key=api_key, model="gemini-2.5-flash-lite-preview-06-17")
-    )
+    NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD,
+    llm_client=GeminiClient(api_key=GOOGLE_API_KEY, model=LLM_MODEL),
+    embedder=GeminiEmbedder(api_key=GOOGLE_API_KEY, embedding_model=EMB_MODEL),
+    cross_encoder=GeminiRerankerClient(api_key=GOOGLE_API_KEY, model=RERANK_MODEL),
 )
 
-app = FastAPI()
+app = FastAPI(title="Graphiti Sidecar (Gemini via fork)")
 
-@app.get("/")
-def root():
-    return JSONResponse(content={"status": "Graphiti с Gemini успешно инициализирован!"})
+def neo4j_driver():
+    return GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
 
-@app.get("/ask")
-def ask(question: str = Query(..., description="Вопрос для LLM")):
+# ---- health & bootstrap ----
+@app.on_event("startup")
+async def init_indices():
+    for i in range(30):
+        try:
+            with neo4j_driver().session() as s:
+                s.run("RETURN 1").single()
+            break
+        except Exception as e:
+            print(f"[startup] bolt not ready ({i+1}/30): {e}")
+            time.sleep(2)
+    else:
+        raise RuntimeError("Neo4j not reachable via bolt")
+    await graphiti.build_indices_and_constraints()
+
+@app.get("/healthz")
+async def health():
     try:
-        response = graphiti.llm_client.chat(question)
-        return JSONResponse(content={"question": question, "answer": response})
+        with neo4j_driver().session() as s:
+            s.run("RETURN 1").single()
+        return {"status": "ok"}
     except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
+        raise HTTPException(500, f"neo4j error: {e}")
 
-@app.get("/embed")
-def embed(text: str = Query(..., description="Текст для эмбеддинга")):
-    try:
-        embedding = graphiti.embedder.embed([text])
-        return JSONResponse(content={"text": text, "embedding": embedding[0]})
-    except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
+# ---- модели ----
+class EpisodeIn(BaseModel):
+    user_id: Optional[str] = None
+    content: Union[dict, str]
+    type: str = "text"
+    description: str = "user_event"
+    reference_time: Optional[datetime] = None
 
-@app.get("/rerank")
-def rerank(query: str = Query(..., description="Запрос"), documents: str = Query(..., description="Документы через ||")):
-    try:
-        docs = documents.split("||")
-        reranked = graphiti.cross_encoder.rerank(query, docs)
-        return JSONResponse(content={"query": query, "documents": docs, "reranked": reranked})
-    except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
+class SearchIn(BaseModel):
+    query: str
+    user_id: Optional[str] = None
+    center_node_uuid: Optional[str] = None
+    limit: int = 8
 
+# ---- CRUD-примеры (Cypher через свой драйвер) ----
 @app.get("/neo4j/cypher")
-def cypher(query: str = Query(..., description="Cypher-запрос для Neo4j")):
+def cypher(query: str = Query(...)):
     try:
-        result = graphiti._db.run(query)
-        data = [record.data() for record in result]
-        return JSONResponse(content={"cypher": query, "result": data})
+        with neo4j_driver().session() as s:
+            data = [r.data() for r in s.run(query)]
+        return {"cypher": query, "result": data}
     except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
+        raise HTTPException(500, str(e))
 
-# CRUD для узлов
 @app.post("/neo4j/node")
-def add_node(label: str = Query(..., description="Label для узла"), properties: dict = Body(..., description="Свойства узла")):
+def add_node(label: str = Query(...), properties: dict = Body(...)):
     try:
         prop_str = ", ".join([f"{k}: ${k}" for k in properties.keys()])
         cypher = f"CREATE (n:{label} {{{prop_str}}}) RETURN n"
-        result = graphiti._db.run(cypher, properties)
-        nodes = [record["n"] for record in result]
-        return JSONResponse(content={"created": True, "nodes": [dict(node) for node in nodes]})
+        with neo4j_driver().session() as s:
+            res = s.run(cypher, **properties)
+            nodes = [dict(record["n"]) for record in res]
+        return {"created": True, "nodes": nodes}
     except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
+        raise HTTPException(500, str(e))
 
 @app.get("/neo4j/node")
-def get_nodes(label: str = Query(..., description="Label узлов"), limit: int = Query(10, description="Лимит")):
+def get_nodes(label: str = Query(...), limit: int = Query(10)):
     try:
-        cypher = f"MATCH (n:{label}) RETURN n LIMIT $limit"
-        result = graphiti._db.run(cypher, {"limit": limit})
-        nodes = [record["n"] for record in result]
-        return JSONResponse(content={"nodes": [dict(node) for node in nodes]})
+        with neo4j_driver().session() as s:
+            res = s.run(f"MATCH (n:{label}) RETURN n LIMIT $limit", limit=limit)
+            nodes = [dict(record["n"]) for record in res]
+        return {"nodes": nodes}
     except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
+        raise HTTPException(500, str(e))
 
-@app.delete("/neo4j/node")
-def delete_node(label: str = Query(..., description="Label"), property_key: str = Query(...), property_value: str = Query(...)):
-    try:
-        cypher = f"MATCH (n:{label} {{{property_key}: $property_value}}) DETACH DELETE n RETURN COUNT(n) as deleted"
-        result = graphiti._db.run(cypher, {"property_value": property_value})
-        deleted = [record["deleted"] for record in result]
-        return JSONResponse(content={"deleted": deleted})
-    except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
+# ---- Episodes / Search (Graphiti API) ----
+@app.post("/episodes")
+async def add_episode(ep: EpisodeIn):
+    now = datetime.now(timezone.utc)
+    src = EpisodeType.text if ep.type == "text" else EpisodeType.json
+    body = ep.content if isinstance(ep.content, str) else json.dumps(ep.content, ensure_ascii=False)
+    ts_before = now
+    await graphiti.add_episode(
+        name="n8n-episode",
+        episode_body=body,
+        source=src,
+        source_description=ep.description,
+        reference_time=ep.reference_time or now,
+    )
+    ts_after = datetime.now(timezone.utc)
+    if ep.user_id:
+        cypher = """
+        MERGE (u:User {id:$uid})
+        WITH u
+        MATCH (n)
+        WHERE n.ingested_at >= $ts_from AND n.ingested_at < $ts_to
+        SET n.tenantId = $uid
+        MERGE (u)-[:OWNS]->(n)
+        """
+        with neo4j_driver().session() as sess:
+            sess.run(cypher, uid=ep.user_id, ts_from=ts_before, ts_to=ts_after)
+    return {"status":"ok"}
 
-@app.put("/neo4j/node")
-def update_node(label: str = Query(...), property_key: str = Query(...), property_value: str = Query(...), update: dict = Body(...)):
-    try:
-        set_str = ", ".join([f"n.{k} = ${k}" for k in update.keys()])
-        cypher = f"MATCH (n:{label} {{{property_key}: $property_value}}) SET {set_str} RETURN n"
-        params = {"property_value": property_value}
-        params.update(update)
-        result = graphiti._db.run(cypher, params)
-        nodes = [record["n"] for record in result]
-        return JSONResponse(content={"updated": [dict(node) for node in nodes]})
-    except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
+@app.post("/search")
+async def search(inp: SearchIn):
+    center_uuid = inp.center_node_uuid
+    if inp.user_id and not center_uuid:
+        with neo4j_driver().session() as s:
+            rec = s.run("MERGE (u:User {id:$uid}) RETURN u.uuid as uuid", uid=inp.user_id).single()
+            center_uuid = rec["uuid"] if rec else None
+    res = await graphiti.search(inp.query, center_node_uuid=center_uuid)
+    return {"facts": [r.model_dump() for r in res[: max(1, int(inp.limit))]]}
 
-# CRUD для ребер
-@app.post("/neo4j/edge")
-def add_edge(from_label: str = Query(...), from_key: str = Query(...), from_value: str = Query(...),
-             to_label: str = Query(...), to_key: str = Query(...), to_value: str = Query(...),
-             rel_type: str = Query(...), properties: dict = Body({}, description="Свойства ребра")):
+# ---- простые LLM/Embed/Rerank демо-ручки (с учетом наших интерфейсов) ----
+@app.get("/ask")
+async def ask(question: str = Query(...)):
     try:
-        prop_str = ", ".join([f"{k}: ${k}" for k in properties.keys()])
-        cypher = (
-            f"MATCH (a:{from_label} {{{from_key}: $from_value}}), (b:{to_label} {{{to_key}: $to_value}}) "
-            f"CREATE (a)-[r:{rel_type} {{{prop_str}}}]->(b) RETURN r"
-        )
-        params = {"from_value": from_value, "to_value": to_value}
-        params.update(properties)
-        result = graphiti._db.run(cypher, params)
-        rels = [record["r"] for record in result]
-        return JSONResponse(content={"created": True, "edges": [dict(rel) for rel in rels]})
+        answer = await graphiti.llm_client.generate(question)   # async!
+        return {"question": question, "answer": answer}
     except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
+        raise HTTPException(500, str(e))
 
-@app.get("/neo4j/edge")
-def get_edges(rel_type: str = Query(...), limit: int = Query(10)):
+@app.get("/embed")
+def embed(text: str = Query(...)):
     try:
-        cypher = f"MATCH ()-[r:{rel_type}]->() RETURN r LIMIT $limit"
-        result = graphiti._db.run(cypher, {"limit": limit})
-        rels = [record["r"] for record in result]
-        return JSONResponse(content={"edges": [dict(rel) for rel in rels]})
+        vecs = graphiti.embedder.embed([text])
+        return {"text": text, "embedding": vecs[0]}
     except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
+        raise HTTPException(500, str(e))
 
-@app.delete("/neo4j/edge")
-def delete_edge(rel_type: str = Query(...), property_key: str = Query(...), property_value: str = Query(...)):
+@app.get("/rerank")
+def rerank(query: str = Query(...), documents: str = Query(..., description="Разделяй ||")):
     try:
-        cypher = f"MATCH ()-[r:{rel_type} {{{property_key}: $property_value}}]->() DELETE r RETURN COUNT(r) as deleted"
-        result = graphiti._db.run(cypher, {"property_value": property_value})
-        deleted = [record["deleted"] for record in result]
-        return JSONResponse(content={"deleted": deleted})
+        docs = documents.split("||")
+        scores = graphiti.cross_encoder.score(query, docs)
+        return {"query": query, "documents": docs, "scores": scores}
     except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
-
-@app.put("/neo4j/edge")
-def update_edge(rel_type: str = Query(...), property_key: str = Query(...), property_value: str = Query(...), update: dict = Body(...)):
-    try:
-        set_str = ", ".join([f"r.{k} = ${k}" for k in update.keys()])
-        cypher = f"MATCH ()-[r:{rel_type} {{{property_key}: $property_value}}]->() SET {set_str} RETURN r"
-        params = {"property_value": property_value}
-        params.update(update)
-        result = graphiti._db.run(cypher, params)
-        rels = [record["r"] for record in result]
-        return JSONResponse(content={"updated": [dict(rel) for rel in rels]})
-    except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
-
-# Получить схему графа
-@app.get("/neo4j/schema")
-def get_schema():
-    try:
-        cypher = "CALL db.schema.visualization()"
-        result = graphiti._db.run(cypher)
-        data = [record.data() for record in result]
-        return JSONResponse(content={"schema": data})
-    except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
+        raise HTTPException(500, str(e))
