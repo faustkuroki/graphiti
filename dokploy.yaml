@@ -21,6 +21,7 @@ services:
       retries: 20
       start_period: 60s
 
+
   graphiti-app:
     image: python:3.11-slim
     restart: unless-stopped
@@ -42,7 +43,7 @@ services:
       "
     depends_on:
       neo4j:
-        condition: service_healthy
+        condition: service_started
     ports:
       - "8000:8000"
 
