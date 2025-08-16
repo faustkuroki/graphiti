@@ -9,7 +9,7 @@ services:
     volumes:
       - .:/app
     working_dir: /app
-    command: bash -c "pip install 'graphiti-core[google-genai]' && python your_entrypoint.py"
+    command: bash -c "pip install 'graphiti-core[google-genai]' && python app.py"
     depends_on:
       - neo4j
   neo4j:
